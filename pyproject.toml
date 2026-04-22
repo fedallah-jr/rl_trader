@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rl_trader"
+version = "0.1.0"
+description = "Multi-asset RL trader on Binance USDT-M futures, 1m resolution"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.3",
+    "torch>=2.6",
+    "gymnasium>=1.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["rl_trader"]
