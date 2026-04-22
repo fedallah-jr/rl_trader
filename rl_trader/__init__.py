@@ -19,3 +19,24 @@ def resolve_device(spec: str | torch.device | None = "auto") -> torch.device:
     if spec is None or spec == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(spec)
+
+
+def maybe_compile_forward(
+    net: torch.nn.Module,
+    device: torch.device,
+    *,
+    enable: bool = True,
+) -> bool:
+    """Monkey-patch ``net.forward = torch.compile(net.forward)`` when enabled
+    and on CUDA; return whether compile was applied.
+
+    Gated on CUDA because CPU compile warmup (tens of seconds) typically
+    dwarfs any speedup on short runs. Patching ``.forward`` on the instance
+    (rather than wrapping the module) ensures ``act()`` and ``evaluate()`` —
+    both of which call ``self.forward(...)`` directly — also route through
+    the compiled graph.
+    """
+    if enable and device.type == "cuda":
+        net.forward = torch.compile(net.forward)
+        return True
+    return False

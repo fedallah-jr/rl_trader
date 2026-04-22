@@ -37,6 +37,12 @@ def evaluate_policy(
     fixed length — makes the per-episode PnL directly comparable across evals
     and across models, and lets all envs step in lockstep under one batched
     forward per step.
+
+    If the date range is too short to fit the requested `episode_length`, the
+    env caps each episode to the usable length on reset; we honour that by
+    looping `min(per-env actual lengths)` times and reporting that length in
+    the returned metrics, so best-model selection is never based on a fake
+    trajectory extent.
     """
     dev = resolve_device(device)
     eval_cfg = replace(
@@ -58,17 +64,32 @@ def evaluate_policy(
     net.eval()
     try:
         obs_per_env: list[dict[str, np.ndarray]] = []
+        per_env_ep_len: list[int] = []
         for env, s in zip(envs, starts):
-            obs, _ = env.reset(seed=0, options={
+            obs, info = env.reset(seed=0, options={
                 "start_idx": int(s),
                 "episode_length": int(episode_length),
             })
             obs_per_env.append(obs)
+            per_env_ep_len.append(int(info["episode_length"]))
 
-        net_pnl    = np.zeros(n_episodes, dtype=np.float64)
-        reward_sum = np.zeros(n_episodes, dtype=np.float64)
+        # Env.reset caps ep_len to `_t_hi - start` when the date range can't
+        # fit the requested length. Lockstep batching forces us to use the
+        # min — any shorter env would otherwise be stepped past its episode
+        # boundary (wrong metrics + eventual out-of-range obs).
+        actual_ep_len = int(min(per_env_ep_len))
+        if actual_ep_len < episode_length:
+            print(
+                f"  WARN: eval range truncates episode_length "
+                f"{episode_length} -> {actual_ep_len} "
+                f"(per-env lens: {per_env_ep_len})"
+            )
 
-        for _ in range(episode_length):
+        net_pnl     = np.zeros(n_episodes, dtype=np.float64)
+        reward_sum  = np.zeros(n_episodes, dtype=np.float64)
+        steps_taken = 0
+
+        for _ in range(actual_ep_len):
             market  = np.stack([o["market"]  for o in obs_per_env], axis=0)
             account = np.stack([o["account"] for o in obs_per_env], axis=0)
             gl      = np.stack([o["globals"] for o in obs_per_env], axis=0)
@@ -81,24 +102,36 @@ def evaluate_policy(
             action_np = action.cpu().numpy()           # [B, N]
 
             next_obs: list[dict[str, np.ndarray]] = []
+            any_done = False
             for i, env in enumerate(envs):
-                o, r, _term, _trunc, info = env.step(action_np[i])
+                o, r, term, trunc, info = env.step(action_np[i])
                 net_pnl[i]    += info["step_pnl"] - info["fees"]
                 reward_sum[i] += r
                 next_obs.append(o)
+                if term or trunc:
+                    any_done = True
             obs_per_env = next_obs
+            steps_taken += 1
+            # Honour lockstep termination. With bankruptcy_K=None and the
+            # start schedule above this only fires on the scheduled final
+            # step (trunc=True) — still worth breaking on so that future
+            # env changes (e.g. bankruptcy reintroduced) can't silently
+            # corrupt per-episode metrics.
+            if any_done:
+                break
     finally:
         net.train(was_training)
         for env in envs:
             env.close()
 
+    step_divisor = max(steps_taken, 1)
     return {
         "mean_net_pnl":     float(np.mean(net_pnl)),
         "std_net_pnl":      float(np.std(net_pnl)),
         "min_net_pnl":      float(np.min(net_pnl)),
         "max_net_pnl":      float(np.max(net_pnl)),
-        "mean_step_reward": float(np.mean(reward_sum / episode_length)),
+        "mean_step_reward": float(np.mean(reward_sum / step_divisor)),
         "n_episodes":       n_episodes,
-        "episode_length":   episode_length,
-        "total_steps":      int(n_episodes * episode_length),
+        "episode_length":   steps_taken,
+        "total_steps":      int(n_episodes * steps_taken),
     }

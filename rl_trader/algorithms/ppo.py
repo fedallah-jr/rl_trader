@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from .. import resolve_device
+from .. import maybe_compile_forward, resolve_device
 from ..architectures.factored_attention import ActorCritic, PolicyConfig
 from ..envs.multi_asset import EnvConfig
 from ..eval.validation import evaluate_policy
@@ -98,12 +98,7 @@ def train_ppo(
 
     net = ActorCritic(policy_cfg).to(device)
     opt = optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-5)
-    # Patch .forward on the instance so act() / evaluate() (which both call
-    # self.forward) also route through the compiled graph. Gated on CUDA —
-    # on CPU the warmup cost dominates for short / smoke-test runs.
-    compiled = cfg.torch_compile and device.type == "cuda"
-    if compiled:
-        net.forward = torch.compile(net.forward)
+    compiled = maybe_compile_forward(net, device, enable=cfg.torch_compile)
     print(
         f"policy params: {net.num_params():,}   device: {device}"
         f"   torch.compile: {'on' if compiled else 'off'}"

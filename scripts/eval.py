@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from rl_trader import maybe_compile_forward, resolve_device
 from rl_trader.envs import EnvConfig, MultiAssetTradingEnv
 from rl_trader.eval import compute_metrics, load_policy, run_rollout, summary_table
 
@@ -22,6 +23,12 @@ def main():
     ap.add_argument("--start-idx", type=int, default=None)
     ap.add_argument("--stochastic", action="store_true", help="sample instead of argmax")
     ap.add_argument("--device", default="auto", help='"auto" (default) picks cuda if available, else cpu')
+    ap.add_argument(
+        "--torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile policy forward on CUDA (default: on). No-op on CPU.",
+    )
     ap.add_argument("--dump", default=None, help="optional path to .npz dump of rollout")
     args = ap.parse_args()
 
@@ -33,15 +40,20 @@ def main():
         start_ts=args.start_ts,
         end_ts=args.end_ts,
     ))
-    net = load_policy(args.checkpoint, device=args.device)
+    dev = resolve_device(args.device)
+    net = load_policy(args.checkpoint, device=dev)
+    compiled = maybe_compile_forward(net, dev, enable=args.torch_compile)
 
-    print(f"evaluating {args.checkpoint} on {args.start_ts} → {args.end_ts}")
+    print(
+        f"evaluating {args.checkpoint} on {args.start_ts} → {args.end_ts}   "
+        f"device: {dev}   torch.compile: {'on' if compiled else 'off'}"
+    )
     res = run_rollout(
         env, net,
         start_idx=args.start_idx,
         n_steps=args.n_steps,
         deterministic=not args.stochastic,
-        device=args.device,
+        device=dev,
     )
     m = compute_metrics(res, notional_U=env.cfg.notional_U)
     print(summary_table(m))
