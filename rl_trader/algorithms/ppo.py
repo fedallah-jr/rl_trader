@@ -67,6 +67,53 @@ class PPOConfig:
     eval_episode_length: int = 10_080    # 1 week of 1m bars per eval episode
 
 
+# ---- GAE ----------------------------------------------------------------
+
+def compute_gae(
+    reward_buf:      torch.Tensor,   # [T, B]
+    value_buf:       torch.Tensor,   # [T, B]
+    term_buf:        torch.Tensor,   # [T, B] 1.0 on true terminal (V=0)
+    trunc_buf:       torch.Tensor,   # [T, B] 1.0 on time-limit truncation
+    trunc_value_buf: torch.Tensor,   # [T, B] V(final_obs) at truncation; 0 else
+    bootstrap_T:     torch.Tensor,   # [B] V at rollout boundary (already accounts
+                                     #     for trunc envs via caller's torch.where)
+    gamma:      float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generalised Advantage Estimation with proper term/trunc handling.
+
+    Two masks, not one:
+      * `non_term` = 1 − term        — governs the δ_t bootstrap. Truncation
+        does NOT zero the bootstrap; V(s') still exists, just via final_obs.
+      * `non_bound` = 1 − (term ∨ trunc)  — governs the GAE recursion carry.
+        ANY episode boundary must stop advantage propagation, because step
+        t+1 belongs to a freshly-reset (different) episode whose advantage
+        is independent of step t.
+
+    Conflating the two (the common CleanRL-style single `done` flag) silently
+    mislabels every truncation as terminal, biasing V(s) near episode ends.
+    """
+    T, B = reward_buf.shape
+    advantages = torch.zeros_like(reward_buf)
+    last_gae = torch.zeros(B, device=reward_buf.device, dtype=reward_buf.dtype)
+    for t in reversed(range(T)):
+        non_term  = 1.0 - term_buf[t]
+        non_bound = 1.0 - torch.maximum(term_buf[t], trunc_buf[t])
+        if t == T - 1:
+            nv = bootstrap_T
+        else:
+            nv = torch.where(
+                trunc_buf[t].bool(),
+                trunc_value_buf[t],
+                value_buf[t + 1],
+            )
+        delta = reward_buf[t] + gamma * nv * non_term - value_buf[t]
+        last_gae = delta + gamma * gae_lambda * non_bound * last_gae
+        advantages[t] = last_gae
+    returns = advantages + value_buf
+    return advantages, returns
+
+
 # ---- training -----------------------------------------------------------
 
 def train_ppo(
@@ -149,16 +196,18 @@ def train_ppo(
     # rollout buffers
     B, T = cfg.n_envs, cfg.n_steps
     pc = policy_cfg
-    market_buf  = torch.zeros(T, B, pc.window, pc.n_symbols, pc.n_features, device=device)
-    account_buf = torch.zeros(T, B, pc.n_symbols, pc.n_account, device=device)
-    globals_buf = torch.zeros(T, B, pc.n_globals, device=device)
-    actions_buf = torch.zeros(T, B, pc.n_symbols, dtype=torch.int64, device=device)
-    logp_buf    = torch.zeros(T, B, device=device)
-    reward_buf  = torch.zeros(T, B, device=device)
-    done_buf    = torch.zeros(T, B, device=device)
-    value_buf   = torch.zeros(T, B, device=device)
+    market_buf       = torch.zeros(T, B, pc.window, pc.n_symbols, pc.n_features, device=device)
+    account_buf      = torch.zeros(T, B, pc.n_symbols, pc.n_account, device=device)
+    globals_buf      = torch.zeros(T, B, pc.n_globals, device=device)
+    actions_buf      = torch.zeros(T, B, pc.n_symbols, dtype=torch.int64, device=device)
+    logp_buf         = torch.zeros(T, B, device=device)
+    reward_buf       = torch.zeros(T, B, device=device)
+    value_buf        = torch.zeros(T, B, device=device)
+    # Split term/trunc + V(final_obs) for correct truncation bootstrap in GAE.
+    term_buf         = torch.zeros(T, B, device=device)
+    trunc_buf        = torch.zeros(T, B, device=device)
+    trunc_value_buf  = torch.zeros(T, B, device=device)
 
-    next_done = torch.zeros(B, device=device)
     n_iters = max(1, cfg.total_timesteps // (B * T))
     global_step = 0
     t0 = time.time()
@@ -180,7 +229,6 @@ def train_ppo(
             market_buf[step]  = market_t
             account_buf[step] = account_t
             globals_buf[step] = globals_t
-            done_buf[step]    = next_done
 
             with torch.no_grad():
                 action, log_prob, value = net.act(market_t, account_t, globals_t)
@@ -188,30 +236,52 @@ def train_ppo(
             logp_buf[step]    = log_prob
             value_buf[step]   = value
 
-            obs_np, r, d = envs.step(action.cpu().numpy())
-            reward_buf[step] = torch.as_tensor(r, device=device)
-            next_done = torch.as_tensor(d, device=device)
+            obs_np, r, term_np, trunc_np, final_obs_list = envs.step(action.cpu().numpy())
+            reward_buf[step] = torch.as_tensor(r,        device=device)
+            term_buf[step]   = torch.as_tensor(term_np,  device=device)
+            trunc_buf[step]  = torch.as_tensor(trunc_np, device=device)
 
-        # ---- GAE ------------------------------------------------------
+            # For envs that truncated (not terminated) this step, compute
+            # V(final_obs) in one batched forward and stash. This is the
+            # correct bootstrap target for GAE on truncations; without it
+            # the learner treats time-limits as terminal (zero future), which
+            # is the common CleanRL-style bug.
+            trunc_idx_np = np.where(trunc_np > 0.0)[0]
+            if trunc_idx_np.size:
+                fm = np.stack([final_obs_list[i]["market"]  for i in trunc_idx_np])
+                fa = np.stack([final_obs_list[i]["account"] for i in trunc_idx_np])
+                fg = np.stack([final_obs_list[i]["globals"] for i in trunc_idx_np])
+                with torch.no_grad():
+                    _, v_final = net.forward(
+                        torch.as_tensor(fm, device=device),
+                        torch.as_tensor(fa, device=device),
+                        torch.as_tensor(fg, device=device),
+                    )
+                trunc_idx = torch.as_tensor(trunc_idx_np, device=device, dtype=torch.long)
+                trunc_value_buf[step].index_copy_(0, trunc_idx, v_final)
+
+        # ---- rollout-boundary bootstrap -------------------------------
+        # `obs_np` now holds the state we'll start iter it+1 from: the
+        # continuation obs for envs that didn't end, or the post-reset obs
+        # for envs that did. V(obs_np) is correct for the former; for envs
+        # truncated at T-1 we must override with V(final_obs) stashed above.
         with torch.no_grad():
             market_t  = torch.as_tensor(obs_np["market"],  device=device)
             account_t = torch.as_tensor(obs_np["account"], device=device)
             globals_t = torch.as_tensor(obs_np["globals"], device=device)
             next_value = net.forward(market_t, account_t, globals_t)[1]
+        bootstrap_T = torch.where(
+            trunc_buf[T - 1].bool(),
+            trunc_value_buf[T - 1],
+            next_value,
+        )
 
-        advantages = torch.zeros_like(reward_buf)
-        last_gae = torch.zeros(B, device=device)
-        for t in reversed(range(T)):
-            if t == T - 1:
-                nonterm = 1.0 - next_done
-                nv = next_value
-            else:
-                nonterm = 1.0 - done_buf[t + 1]
-                nv = value_buf[t + 1]
-            delta = reward_buf[t] + cfg.gamma * nv * nonterm - value_buf[t]
-            last_gae = delta + cfg.gamma * cfg.gae_lambda * nonterm * last_gae
-            advantages[t] = last_gae
-        returns = advantages + value_buf
+        advantages, returns = compute_gae(
+            reward_buf, value_buf,
+            term_buf, trunc_buf, trunc_value_buf,
+            bootstrap_T,
+            cfg.gamma, cfg.gae_lambda,
+        )
 
         # ---- flatten & update ----------------------------------------
         bs = B * T
