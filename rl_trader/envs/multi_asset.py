@@ -35,11 +35,11 @@ class EnvConfig:
     window: int = 128                   # bars of history in observation
     episode_min: int = 1440             # min steps per episode (1 day)
     episode_max: int = 10080            # max steps per episode (1 week)
-    taker_bps: float = 5e-4             # 5 bps all-in per leg (taker + slippage)
+    taker_bps: float = 0.0              # per-leg fee+slippage; default off for signal-finding
     notional_U: float = 1.0             # fixed per-symbol notional, reward normalized by this
     start_ts: str | None = None         # inclusive ISO date, e.g. "2022-01-01"
     end_ts:   str | None = None         # inclusive ISO date
-    bankruptcy_K: float | None = 3.0    # terminate when cum_pnl < -K × U; None to disable
+    bankruptcy_K: float | None = 10.0   # terminate when cum_pnl < -K × U; None to disable
     bankruptcy_penalty: float = -1.0    # reward delivered on bankruptcy termination
 
     # Vol-scaled reward (Zhang, Zohren, Roberts 2019, option A adaptation).
