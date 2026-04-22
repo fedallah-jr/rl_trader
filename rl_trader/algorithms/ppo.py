@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from .. import resolve_device
 from ..architectures.factored_attention import ActorCritic, PolicyConfig
 from ..envs.multi_asset import EnvConfig
 from ..eval.validation import evaluate_policy
@@ -50,8 +51,11 @@ class PPOConfig:
     normalize_advantage: bool = True
 
     # infra
-    device: str = "cpu"
+    device: str = "auto"         # "auto" -> cuda if available else cpu
     torch_threads: int = 2
+    # Compile the policy forward with torch.compile. Only applied on CUDA
+    # (CPU compile warmup dwarfs any CPU-side speedup for short runs).
+    torch_compile: bool = True
     seed: int = 0
     log_interval: int = 1
     ckpt_interval: int = 50
@@ -61,7 +65,6 @@ class PPOConfig:
     eval_interval_steps: int = 50_000    # every ~50 iterations at defaults
     eval_episodes: int = 4               # fixed starts inside the val range
     eval_episode_length: int = 10_080    # 1 week of 1m bars per eval episode
-    eval_at_start: bool = True           # run one eval before any training (sanity baseline)
 
 
 # ---- training -----------------------------------------------------------
@@ -77,7 +80,7 @@ def train_ppo(
     rollouts). Best weights are saved to `<ckpt_dir>/best.pt` both on-improvement
     and at the end of training.
     """
-    device = torch.device(cfg.device)
+    device = resolve_device(cfg.device)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
@@ -91,15 +94,20 @@ def train_ppo(
 
     # best-model tracking (only if we have a val env)
     do_val = val_env_cfg is not None and cfg.eval_interval_steps > 0
-    best_metric = float("-inf")
-    best_state: dict | None = None
-    best_iter: int = -1
-    best_step: int = -1
     last_eval_step: int = 0
 
     net = ActorCritic(policy_cfg).to(device)
     opt = optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-5)
-    print(f"policy params: {net.num_params():,}   device: {device}")
+    # Patch .forward on the instance so act() / evaluate() (which both call
+    # self.forward) also route through the compiled graph. Gated on CUDA —
+    # on CPU the warmup cost dominates for short / smoke-test runs.
+    compiled = cfg.torch_compile and device.type == "cuda"
+    if compiled:
+        net.forward = torch.compile(net.forward)
+    print(
+        f"policy params: {net.num_params():,}   device: {device}"
+        f"   torch.compile: {'on' if compiled else 'off'}"
+    )
 
     # ---- val-eval helper (closure over cfg / val_env_cfg / best) ---------
     best = {"metric": float("-inf"), "state": None, "iter": -1, "step": -1,
@@ -110,7 +118,7 @@ def train_ppo(
             net, val_env_cfg,
             n_episodes=cfg.eval_episodes,
             episode_length=cfg.eval_episode_length,
-            device=str(device),
+            device=device,
         )
         print(
             f"  VAL @ step {gstep:>9,}  "
@@ -142,10 +150,6 @@ def train_ppo(
                 bk,
             )
             print(f"  → new best, saved {bk}")
-
-    # baseline val eval before any training (expected: flat policy → ~0 pnl)
-    if do_val and cfg.eval_at_start:
-        _run_val(it_idx=-1, gstep=0)
 
     # rollout buffers
     B, T = cfg.n_envs, cfg.n_steps

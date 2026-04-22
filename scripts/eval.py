@@ -21,7 +21,7 @@ def main():
     ap.add_argument("--n-steps", type=int, default=None, help="cap on rollout length")
     ap.add_argument("--start-idx", type=int, default=None)
     ap.add_argument("--stochastic", action="store_true", help="sample instead of argmax")
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--device", default="auto", help='"auto" (default) picks cuda if available, else cpu')
     ap.add_argument("--dump", default=None, help="optional path to .npz dump of rollout")
     args = ap.parse_args()
 

@@ -254,10 +254,6 @@ weights (by mean net-PnL across those rollouts) are saved to
 `<ckpt-dir>/best.pt` whenever they improve, and the returned network has the
 best weights restored when training ends.
 
-An initial baseline val eval runs before any gradient updates, so the log
-shows a `mean_net_pnl ≈ 0` baseline from the flat-biased init before any
-training effect can contaminate the first measurement.
-
 ---
 
 ## Adding new components

@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from .. import resolve_device
 from ..architectures.base import AbstractActorCritic
 from ..architectures.factored_attention import ActorCritic, PolicyConfig
 from ..envs.multi_asset import MultiAssetTradingEnv
@@ -33,11 +34,11 @@ def run_rollout(
     start_idx: int | None = None,
     n_steps: int | None = None,
     deterministic: bool = True,
-    device: str | torch.device = "cpu",
+    device: str | torch.device = "auto",
 ) -> RolloutResult:
     """Reset the env once, roll out the policy for `n_steps` steps (or a full
     episode), and record every action/position/reward/pnl."""
-    device = torch.device(device)
+    device = resolve_device(device)
     net = net.eval().to(device)
 
     options: dict[str, Any] = {}
@@ -83,9 +84,9 @@ def run_rollout(
     )
 
 
-def load_policy(ckpt_path: str | Path, device: str | torch.device = "cpu") -> ActorCritic:
+def load_policy(ckpt_path: str | Path, device: str | torch.device = "auto") -> ActorCritic:
     """Load a PPO checkpoint and reconstruct the ActorCritic from stored cfg."""
-    dev = torch.device(device)
+    dev = resolve_device(device)
     ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
     pcfg_dict = ck.get("policy_cfg") or {}
     pcfg = PolicyConfig(**pcfg_dict) if pcfg_dict else PolicyConfig()
